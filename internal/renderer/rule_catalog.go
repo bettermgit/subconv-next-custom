@@ -84,7 +84,6 @@ var ruleOutputOrder = []string{
 // ruleAllOrder 是全量内置规则的输出顺序（仅一套目录）。
 var ruleAllOrder = append([]string(nil), ruleOutputOrder...)
 
-
 var ruleFullOutputOrder = append([]string{
 	"adblock",
 	"private",

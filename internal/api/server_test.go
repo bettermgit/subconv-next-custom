@@ -3329,7 +3329,7 @@ func TestEditorAccessKeepsExpiredPublishedWorkspace(t *testing.T) {
 		if err != nil {
 			t.Fatalf("loadWorkspaceByHash() error = %v", err)
 		}
-		loaded.Meta.LastAccessAt = time.Now().UTC().Add(-48 * time.Hour)
+		loaded.Meta.LastAccessAt = time.Now().UTC().Add(-(time.Duration(cfg.Service.WorkspaceTTLSeconds)*time.Second + time.Hour))
 		// saveWorkspaceMeta keeps the newer access time, so write directly.
 		if err := server.writeWorkspaceMetaUnlocked(loaded); err != nil {
 			t.Fatalf("writeWorkspaceMetaUnlocked() error = %v", err)

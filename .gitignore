@@ -12,3 +12,10 @@ checksums.txt
 *.log
 config/config.local.json
 .askpass.bat
+
+# node artifacts (项目无 JS 工具链)
+package-lock.json
+node_modules/
+
+# 内部维护文档（不进入公开仓库）
+.maintenance/

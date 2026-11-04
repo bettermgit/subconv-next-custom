@@ -55,7 +55,7 @@ func TestLoadJSONAndUCIParity(t *testing.T) {
 			RefreshOnRequest:                true,
 			StaleIfError:                    true,
 			StrictMode:                      true,
-			WorkspaceTTLSeconds:             86400,
+			WorkspaceTTLSeconds:             2592000,
 			WorkspaceCleanupIntervalSeconds: 3600,
 			WorkspaceCleanupInterval:        3600,
 			PublicBaseURL:                   "",

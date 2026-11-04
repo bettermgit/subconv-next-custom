@@ -303,7 +303,7 @@ func DefaultServiceConfig() ServiceConfig {
 		RefreshOnRequest:                true,
 		StaleIfError:                    true,
 		StrictMode:                      true,
-		WorkspaceTTLSeconds:             86400,
+		WorkspaceTTLSeconds:             2592000, // 30 days
 		WorkspaceCleanupIntervalSeconds: 3600,
 		WorkspaceCleanupInterval:        3600,
 		MaxSubscriptionBytes:            DefaultMaxSubscriptionB,
