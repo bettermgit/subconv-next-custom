@@ -1,0 +1,451 @@
+package api
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"subconv-next/internal/model"
+	"subconv-next/internal/pipeline"
+	"subconv-next/internal/renderer"
+)
+
+var (
+	ErrRefreshInProgress = errors.New("refresh is already running")
+	ErrRefreshCapacity   = errors.New("refresh capacity is currently full")
+)
+
+const (
+	serviceRefreshKey = "\x00service"
+)
+
+type refreshOutcome struct {
+	Result pipeline.RenderResult
+	At     time.Time
+}
+
+type refreshFailedError struct {
+	message string
+	cause   error
+}
+
+func (err refreshFailedError) Error() string {
+	return err.message
+}
+
+func (err refreshFailedError) Unwrap() error {
+	return err.cause
+}
+
+func refreshErrorMessage(err error, result pipeline.RenderResult) string {
+	if err == nil {
+		return ""
+	}
+	if !errors.Is(err, pipeline.ErrNoNodes) {
+		return err.Error()
+	}
+
+	for _, parseErr := range result.Errors {
+		message := strings.TrimSpace(parseErr.Message)
+		if message == "" {
+			continue
+		}
+		if strings.TrimSpace(parseErr.Kind) != "" {
+			return "no nodes available for rendering: [" + parseErr.Kind + "] " + message
+		}
+		return "no nodes available for rendering: " + message
+	}
+	return "no nodes available for rendering"
+}
+
+func (s *Server) startRefresh(reason string) (*refreshOutcome, error) {
+	return s.startRefreshForConfig(s.snapshotConfig(), "", reason)
+}
+
+func (s *Server) startRefreshForConfig(cfg model.Config, workspaceHash, reason string) (*refreshOutcome, error) {
+	keys := refreshRunKeys(cfg, workspaceHash)
+	s.refreshMu.Lock()
+	for _, key := range keys {
+		if _, running := s.refreshRuns[key]; running {
+			s.refreshMu.Unlock()
+			return nil, ErrRefreshInProgress
+		}
+	}
+	select {
+	case s.refreshSlots <- struct{}{}:
+	default:
+		s.refreshMu.Unlock()
+		return nil, ErrRefreshCapacity
+	}
+	done := make(chan struct{})
+	for _, key := range keys {
+		s.refreshRuns[key] = done
+	}
+	s.setRefreshing(true)
+	s.refreshMu.Unlock()
+
+	defer s.finishRefresh(keys, done)
+
+	outcome, err := s.executeRefresh(cfg, workspaceHash, reason)
+	if err != nil {
+		return nil, err
+	}
+	return outcome, nil
+}
+
+func refreshRunKeys(cfg model.Config, workspaceHash string) []string {
+	keys := make([]string, 0, 2)
+	if workspaceHash = strings.TrimSpace(workspaceHash); workspaceHash == "" {
+		keys = append(keys, serviceRefreshKey)
+	} else {
+		keys = append(keys, "workspace:"+workspaceHash)
+	}
+	if outputPath := strings.TrimSpace(cfg.Service.OutputPath); outputPath != "" {
+		keys = append(keys, "output:"+filepath.Clean(outputPath))
+	}
+	return keys
+}
+
+func (s *Server) finishRefresh(keys []string, done chan struct{}) {
+	s.refreshMu.Lock()
+	released := false
+	for _, key := range keys {
+		if s.refreshRuns[key] == done {
+			delete(s.refreshRuns, key)
+			released = true
+		}
+	}
+	if released {
+		<-s.refreshSlots
+	}
+	s.setRefreshing(len(s.refreshSlots) > 0)
+	s.refreshMu.Unlock()
+	if released {
+		close(done)
+	}
+}
+
+func (s *Server) waitForRefresh(timeout time.Duration) bool {
+	s.refreshMu.Lock()
+	done := s.refreshRuns[serviceRefreshKey]
+	s.refreshMu.Unlock()
+	if done == nil {
+		return true
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+func (s *Server) executeRefresh(cfg model.Config, workspaceHash, reason string) (*refreshOutcome, error) {
+	cfg = s.withGlobalCustomRules(cfg)
+	if s.refreshBeforeRun != nil {
+		s.refreshBeforeRun()
+	}
+	s.setRefreshStage("fetching")
+	result, err := pipeline.RenderConfigWithProgress(cfg, func(stage string) {
+		s.setRefreshStage(stage)
+	})
+	now := time.Now().UTC()
+	if err != nil {
+		message := refreshErrorMessage(err, result)
+		s.setRefreshFailure(message, now)
+		s.appendLog(reason + " failed: " + message)
+		s.appendWorkspaceLog(workspaceHash, reason+" failed: "+message)
+		if s.refreshAfterRun != nil {
+			s.refreshAfterRun()
+		}
+		return nil, refreshFailedError{message: message, cause: err}
+	}
+	s.setRefreshStage("writing")
+	if err := pipeline.SaveNodeState(cfg, result.State); err != nil {
+		s.setRefreshFailure(err.Error(), now)
+		s.appendLog(reason + " state save failed: " + err.Error())
+		s.appendWorkspaceLog(workspaceHash, reason+" state save failed: "+err.Error())
+		if s.refreshAfterRun != nil {
+			s.refreshAfterRun()
+		}
+		return nil, err
+	}
+	stagedPath := filepath.Join(filepath.Dir(result.OutputPath), "."+filepath.Base(result.OutputPath)+".validate")
+	defer func() {
+		_ = os.Remove(stagedPath)
+	}()
+	if err := pipeline.WriteRendered(stagedPath, result.YAML); err != nil {
+		s.setRefreshFailure(err.Error(), now)
+		s.appendLog(reason + " write failed: " + err.Error())
+		s.appendWorkspaceLog(workspaceHash, reason+" write failed: "+err.Error())
+		if s.refreshAfterRun != nil {
+			s.refreshAfterRun()
+		}
+		return nil, err
+	}
+	if s.refreshAfterWrite != nil {
+		s.refreshAfterWrite(stagedPath)
+	}
+	written, err := os.ReadFile(stagedPath)
+	if err != nil {
+		s.setRefreshFailure(err.Error(), now)
+		s.appendLog(reason + " post-write validation read failed: " + err.Error())
+		s.appendWorkspaceLog(workspaceHash, reason+" post-write validation read failed: "+err.Error())
+		if s.refreshAfterRun != nil {
+			s.refreshAfterRun()
+		}
+		return nil, err
+	}
+	if err := pipeline.ValidateFinalConfig(written, pipeline.FinalNodeSet{Nodes: result.Nodes}, result.Audit, renderer.OptionsFromConfig(cfg)); err != nil {
+		s.setRefreshFailure(err.Error(), now)
+		s.appendLog(reason + " post-write validation failed: " + err.Error())
+		s.appendWorkspaceLog(workspaceHash, reason+" post-write validation failed: "+err.Error())
+		if s.refreshAfterRun != nil {
+			s.refreshAfterRun()
+		}
+		return nil, err
+	}
+	if err := pipeline.WriteRendered(result.OutputPath, written); err != nil {
+		s.setRefreshFailure(err.Error(), now)
+		s.appendLog(reason + " write failed: " + err.Error())
+		s.appendWorkspaceLog(workspaceHash, reason+" write failed: "+err.Error())
+		if s.refreshAfterRun != nil {
+			s.refreshAfterRun()
+		}
+		return nil, err
+	}
+
+	s.setRefreshSuccess(result.NodeCount, nodeNames(result.Nodes), result.OutputPath, now)
+	if strings.TrimSpace(workspaceHash) != "" {
+		s.setWorkspaceStatus(workspaceHash, model.RuntimeStatus{
+			StartedAt:                now,
+			Running:                  true,
+			LastRefreshAt:            now,
+			LastSuccessAt:            now,
+			NextRefreshAt:            nextRefreshTime(now, cfg),
+			RefreshInterval:          effectiveRefreshInterval(cfg),
+			YAMLExists:               true,
+			YAMLUpdatedAt:            now,
+			UpstreamSourceCount:      enabledSubscriptionCount(cfg.Subscriptions),
+			NodeCount:                result.NodeCount,
+			NodeNames:                nodeNames(result.Nodes),
+			EnabledSubscriptionCount: enabledSubscriptionCount(cfg.Subscriptions),
+			OutputPath:               result.OutputPath,
+		})
+	}
+	for _, warning := range result.Warnings {
+		s.appendLog(reason + " warning: " + warning)
+		s.appendWorkspaceLog(workspaceHash, reason+" warning: "+warning)
+	}
+	for _, parseErr := range result.Errors {
+		s.appendLog(reason + " parse error [" + parseErr.Kind + "]: " + parseErr.Message)
+		s.appendWorkspaceLog(workspaceHash, reason+" parse error ["+parseErr.Kind+"]: "+parseErr.Message)
+	}
+	s.appendLog(reason + " succeeded: wrote " + result.OutputPath)
+	s.appendWorkspaceLog(workspaceHash, reason+" succeeded: wrote "+result.OutputPath)
+	if s.refreshAfterRun != nil {
+		s.refreshAfterRun()
+	}
+	return &refreshOutcome{Result: result, At: now}, nil
+}
+
+func (s *Server) refreshPublishedWorkspace(ref workspaceRef, reason string) (*refreshOutcome, publishedRef, error) {
+	workspaceHash := strings.TrimSpace(ref.Hash)
+	if workspaceHash == "" {
+		return nil, publishedRef{}, errWorkspaceNotFound
+	}
+	unlock := s.lockWorkspaceHash(workspaceHash)
+	defer unlock()
+	currentRef, err := s.loadWorkspaceByHash(workspaceHash)
+	if err != nil {
+		return nil, publishedRef{}, err
+	}
+	ref = currentRef
+	publishID := strings.TrimSpace(ref.Meta.PublishID)
+	if publishID == "" {
+		return nil, publishedRef{}, errWorkspaceNotFound
+	}
+	published, err := s.loadPublishedByID(publishID)
+	if err != nil {
+		return nil, publishedRef{}, err
+	}
+	if published.Meta.Revoked || strings.TrimSpace(published.Meta.Token) == "" {
+		return nil, published, errWorkspaceNotFound
+	}
+	cfg, err := s.loadWorkspaceConfig(ref)
+	if err != nil {
+		return nil, published, err
+	}
+	cfg.Service.OutputPath = published.CurrentPath
+	outcome, err := s.startRefreshForConfig(cfg, ref.Hash, reason)
+	if err != nil {
+		return nil, published, err
+	}
+	if err := s.finalizePublishedRefresh(&ref, &published, cfg, outcome.Result); err != nil {
+		return nil, published, err
+	}
+	return outcome, published, nil
+}
+
+func (s *Server) refreshPublishedWorkspaces(reason string) {
+	for _, ref := range s.refreshablePublishedWorkspaces() {
+		_, published, err := s.refreshPublishedWorkspace(ref, reason)
+		if err == nil {
+			s.appendLog(reason + " succeeded: publish=" + published.ID)
+			continue
+		}
+		if errors.Is(err, ErrRefreshInProgress) {
+			s.appendWorkspaceLog(ref.Hash, reason+" skipped: refresh already running")
+			continue
+		}
+		s.appendLog(reason + " failed: publish=" + ref.Meta.PublishID + " error=" + err.Error())
+		s.appendWorkspaceLog(ref.Hash, reason+" failed: "+err.Error())
+	}
+}
+
+func (s *Server) refreshablePublishedWorkspaces() []workspaceRef {
+	root := s.workspaceRootDir()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+
+	byPublishID := map[string]workspaceRef{}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		ref, err := s.loadWorkspaceByHash(entry.Name())
+		if err != nil {
+			continue
+		}
+		publishID := strings.TrimSpace(ref.Meta.PublishID)
+		if publishID == "" {
+			continue
+		}
+		published, err := s.loadPublishedByID(publishID)
+		if err != nil || published.Meta.Revoked || strings.TrimSpace(published.Meta.Token) == "" {
+			continue
+		}
+		current, ok := byPublishID[publishID]
+		preferredHash := strings.TrimSpace(published.Meta.WorkspaceHash)
+		switch {
+		case !ok:
+			byPublishID[publishID] = ref
+		case preferredHash != "" && ref.Hash == preferredHash:
+			byPublishID[publishID] = ref
+		case preferredHash != "" && current.Hash == preferredHash:
+			continue
+		case ref.Meta.LastAccessAt.After(current.Meta.LastAccessAt):
+			byPublishID[publishID] = ref
+		}
+	}
+
+	refs := make([]workspaceRef, 0, len(byPublishID))
+	for _, ref := range byPublishID {
+		refs = append(refs, ref)
+	}
+	sort.Slice(refs, func(i, j int) bool {
+		return refs[i].Hash < refs[j].Hash
+	})
+	return refs
+}
+
+func (s *Server) StartScheduler(stop <-chan struct{}) {
+	go func() {
+		cfg := s.snapshotConfig()
+		if !yamlFileExists(cfg.Service.OutputPath) {
+			_, _ = s.startRefresh("startup refresh")
+		}
+		s.refreshPublishedWorkspaces("startup published refresh")
+		for {
+			cfg = s.snapshotConfig()
+			interval := time.Duration(effectiveRefreshInterval(cfg)) * time.Second
+			timer := time.NewTimer(interval)
+			select {
+			case <-stop:
+				timer.Stop()
+				return
+			case <-timer.C:
+				_, err := s.startRefresh("scheduled refresh")
+				if err != nil && !errors.Is(err, ErrRefreshInProgress) && !errors.Is(err, ErrRefreshCapacity) {
+					s.appendLog("scheduled refresh failed: " + err.Error())
+				}
+				s.refreshPublishedWorkspaces("scheduled published refresh")
+			}
+		}
+	}()
+
+	go func() {
+		for {
+			cfg := s.snapshotConfig()
+			interval := time.Duration(workspaceCleanupInterval(cfg)) * time.Second
+			if interval <= 0 {
+				interval = time.Hour
+			}
+			timer := time.NewTimer(interval)
+			select {
+			case <-stop:
+				timer.Stop()
+				return
+			case <-timer.C:
+				if err := s.cleanupExpiredWorkspaces(); err != nil {
+					s.appendLog("workspace cleanup failed: " + err.Error())
+				}
+				if err := s.cleanupStalePublished(); err != nil {
+					s.appendLog("published cleanup failed: " + err.Error())
+				}
+			}
+		}
+	}()
+}
+
+func effectiveRefreshInterval(cfg model.Config) int {
+	if cfg.Service.RefreshInterval <= 0 {
+		return model.DefaultRefreshInterval
+	}
+	return cfg.Service.RefreshInterval
+}
+
+func nextRefreshTime(now time.Time, cfg model.Config) time.Time {
+	return now.UTC().Add(time.Duration(effectiveRefreshInterval(cfg)) * time.Second)
+}
+
+func yamlFileExists(path string) bool {
+	if path == "" {
+		return false
+	}
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
+func yamlFileUpdatedAt(path string) time.Time {
+	if path == "" {
+		return time.Time{}
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return time.Time{}
+	}
+	return info.ModTime().UTC()
+}
+
+func cacheExpired(path string, refreshIntervalSeconds int) bool {
+	if !yamlFileExists(path) {
+		return true
+	}
+	if refreshIntervalSeconds <= 0 {
+		return false
+	}
+	updatedAt := yamlFileUpdatedAt(path)
+	if updatedAt.IsZero() {
+		return true
+	}
+	return time.Since(updatedAt) > time.Duration(refreshIntervalSeconds)*time.Second
+}

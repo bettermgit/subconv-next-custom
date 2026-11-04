@@ -1,0 +1,330 @@
+package pipeline
+
+import (
+	"bytes"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	"subconv-next/internal/model"
+)
+
+func TestCollectNodesWithStateDoesNotFetchUncachedSubscriptions(t *testing.T) {
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		_, _ = w.Write([]byte("ss://YWVzLTI1Ni1nY206cGFzc0BleGFtcGxlLmNvbTo0NDM=#cold-node"))
+	}))
+	defer upstream.Close()
+
+	cfg := model.DefaultConfig()
+	cfg.Service.CacheDir = filepath.Join(t.TempDir(), "cache")
+	cfg.Subscriptions = []model.SubscriptionConfig{
+		{Name: "cold-source", Enabled: true, URL: upstream.URL, AllowLAN: true},
+	}
+
+	result := CollectNodesWithState(cfg, model.NodeState{}, true, false)
+
+	if requests.Load() != 0 {
+		t.Fatalf("editor collect hit the network %d times, want 0", requests.Load())
+	}
+	if len(result.Nodes) != 0 {
+		t.Fatalf("nodes = %#v, want none without cache", result.Nodes)
+	}
+	joined := strings.Join(result.Warnings, "\n")
+	if !strings.Contains(joined, "尚无本地缓存") {
+		t.Fatalf("warnings = %#v, want cache-miss notice", result.Warnings)
+	}
+	for _, parseErr := range result.Errors {
+		if parseErr.Kind == "FETCH_FAILED" {
+			t.Fatalf("cache miss surfaced as FETCH_FAILED: %#v", result.Errors)
+		}
+	}
+}
+
+func TestApplyNodeOverrides(t *testing.T) {
+	node := model.NormalizeNode(model.NodeIR{
+		Name:   "old-name",
+		Type:   model.ProtocolAnyTLS,
+		Server: "example.com",
+		Port:   443,
+		Auth:   model.Auth{Password: "old-pass"},
+		TLS: model.TLSOptions{
+			Enabled:           true,
+			SNI:               "old.example.com",
+			ClientFingerprint: "chrome",
+		},
+		UDP: model.Bool(true),
+	})
+
+	overridden := applyNodeOverrides([]model.NodeIR{node}, map[string]model.NodeOverride{
+		node.ID: {
+			Name:   "new-name",
+			Region: "JP",
+			Tags:   []string{"jp"},
+			Fields: model.NodeOverrideFields{
+				Server: "override.example.com",
+				Port:   8443,
+				UDP:    model.Bool(false),
+				TLS: &model.TLSOptions{
+					Enabled:           true,
+					SNI:               "override.example.com",
+					ClientFingerprint: "firefox",
+				},
+				Auth: &model.Auth{Password: "new-pass"},
+				Raw:  map[string]interface{}{"idleSessionTimeout": "30s"},
+			},
+		},
+	})
+
+	got := overridden[0]
+	if got.Name != "new-name" || got.Server != "override.example.com" || got.Port != 8443 {
+		t.Fatalf("override result = %#v, want name/server/port replaced", got)
+	}
+	if got.UDP == nil || *got.UDP {
+		t.Fatalf("override UDP = %#v, want false", got.UDP)
+	}
+	if got.TLS.SNI != "override.example.com" || got.TLS.ClientFingerprint != "firefox" {
+		t.Fatalf("override TLS = %#v, want replacement", got.TLS)
+	}
+	if got.Auth.Password != "new-pass" {
+		t.Fatalf("override Auth.Password = %q, want %q", got.Auth.Password, "new-pass")
+	}
+	if got.ID != node.ID {
+		t.Fatalf("override ID = %q, want original %q", got.ID, node.ID)
+	}
+}
+
+func TestFilterDisabledNodes(t *testing.T) {
+	nodes := []model.NodeIR{
+		model.NormalizeNode(model.NodeIR{Name: "a", Type: model.ProtocolSS, Server: "a.example.com", Port: 1}),
+		model.NormalizeNode(model.NodeIR{Name: "b", Type: model.ProtocolSS, Server: "b.example.com", Port: 1}),
+	}
+
+	got := filterDisabledNodes(nodes, []string{nodes[1].ID})
+	if len(got) != 1 || got[0].ID != nodes[0].ID {
+		t.Fatalf("filterDisabledNodes() = %#v, want only first node", got)
+	}
+}
+
+func TestCollectNodesWithStateIncludesCustomNodes(t *testing.T) {
+	cfg := model.DefaultConfig()
+	cfg.Inline = []model.InlineConfig{
+		{
+			Name:    "manual",
+			Enabled: true,
+			Content: "ss://YWVzLTI1Ni1nY206cGFzc0BleGFtcGxlLmNvbTo0NDM=#ss-node",
+		},
+	}
+
+	custom := model.NormalizeNode(model.NodeIR{
+		Name:   "custom-vless",
+		Type:   model.ProtocolVLESS,
+		Server: "custom.example.com",
+		Port:   443,
+		Auth:   model.Auth{UUID: "uuid-1"},
+		Source: model.SourceInfo{ID: "custom", Name: "manual", Kind: "custom"},
+	})
+	custom.ID = "custom-" + custom.ID
+
+	result := CollectNodesWithState(cfg, model.NodeState{
+		NodeOverrides: map[string]model.NodeOverride{},
+		DisabledNodes: []string{},
+		CustomNodes:   []model.NodeIR{custom},
+	}, true, false)
+
+	if len(result.Nodes) != 2 {
+		t.Fatalf("len(result.Nodes) = %d, want 2", len(result.Nodes))
+	}
+	foundCustom := false
+	for _, node := range result.Nodes {
+		if node.ID == custom.ID {
+			foundCustom = true
+			break
+		}
+	}
+	if !foundCustom {
+		t.Fatalf("custom node %#v not found in %#v", custom, result.Nodes)
+	}
+}
+
+func TestRenderConfigUsesOverrideValues(t *testing.T) {
+	cfg := model.DefaultConfig()
+	cfg.Service.StatePath = filepath.Join(t.TempDir(), "state.json")
+	cfg.Service.OutputPath = filepath.Join(t.TempDir(), "mihomo.yaml")
+	cfg.Inline = []model.InlineConfig{
+		{
+			Name:    "manual",
+			Enabled: true,
+			Content: "ss://YWVzLTI1Ni1nY206cGFzc0BleGFtcGxlLmNvbTo0NDM=#ss-node",
+		},
+	}
+
+	base := collectNodes(cfg, true, false)
+	nodeID := base.Nodes[0].ID
+	err := SaveNodeState(cfg, model.NodeState{
+		NodeOverrides: map[string]model.NodeOverride{
+			nodeID: {
+				Name: "renamed-ss",
+				Fields: model.NodeOverrideFields{
+					Server: "override.example.com",
+					Port:   9443,
+					Auth:   &model.Auth{Password: "pass"},
+					Raw:    map[string]interface{}{"method": "aes-256-gcm"},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("SaveNodeState() error = %v", err)
+	}
+
+	result, err := RenderConfig(cfg)
+	if err != nil {
+		t.Fatalf("RenderConfig() error = %v", err)
+	}
+	if !bytes.Contains(result.YAML, []byte(`renamed-ss`)) {
+		t.Fatalf("rendered YAML = %q, want renamed node", string(result.YAML))
+	}
+	if !bytes.Contains(result.YAML, []byte("server: override.example.com")) {
+		t.Fatalf("rendered YAML = %q, want overridden server", string(result.YAML))
+	}
+}
+
+func TestRenderConfigSkipsDisabledAndIncludesCustomNodes(t *testing.T) {
+	cfg := model.DefaultConfig()
+	cfg.Service.StatePath = filepath.Join(t.TempDir(), "state.json")
+	cfg.Service.OutputPath = filepath.Join(t.TempDir(), "mihomo.yaml")
+	cfg.Inline = []model.InlineConfig{
+		{
+			Name:    "manual",
+			Enabled: true,
+			Content: "ss://YWVzLTI1Ni1nY206cGFzc0BleGFtcGxlLmNvbTo0NDM=#ss-node",
+		},
+	}
+
+	base := collectNodes(cfg, true, false)
+	nodeID := base.Nodes[0].ID
+	custom := model.NormalizeNode(model.NodeIR{
+		Name:   "custom-vless",
+		Type:   model.ProtocolVLESS,
+		Server: "custom.example.com",
+		Port:   443,
+		Auth:   model.Auth{UUID: "uuid-1"},
+		TLS:    model.TLSOptions{Enabled: true, SNI: "custom.example.com"},
+		Source: model.SourceInfo{Name: "manual", Kind: "custom"},
+	})
+	custom.ID = "custom-" + custom.ID
+
+	err := SaveNodeState(cfg, model.NodeState{
+		DisabledNodes: []string{nodeID},
+		CustomNodes:   []model.NodeIR{custom},
+	})
+	if err != nil {
+		t.Fatalf("SaveNodeState() error = %v", err)
+	}
+
+	result, err := RenderConfig(cfg)
+	if err != nil {
+		t.Fatalf("RenderConfig() error = %v", err)
+	}
+	if bytes.Contains(result.YAML, []byte(`ss-node`)) {
+		t.Fatalf("rendered YAML = %q, disabled node should be excluded", string(result.YAML))
+	}
+	if !bytes.Contains(result.YAML, []byte(`custom-vless`)) {
+		t.Fatalf("rendered YAML = %q, custom node should be included", string(result.YAML))
+	}
+}
+
+func TestApplyRenderPreferencesFiltersInvalidSSNode(t *testing.T) {
+	nodes := []model.NodeIR{
+		model.NormalizeNode(model.NodeIR{
+			Name:   "invalid-ss",
+			Type:   model.ProtocolSS,
+			Server: "example.com",
+			Port:   443,
+			Auth:   model.Auth{Password: "secret"},
+		}),
+	}
+
+	got := applyRenderPreferences(nodes, model.RenderConfig{
+		FilterIllegal: true,
+		UDP:           true,
+	})
+	if len(got) != 0 {
+		t.Fatalf("applyRenderPreferences() = %#v, want invalid ss node filtered", got)
+	}
+}
+
+func TestApplyRenderPreferencesPreservesExplicitUDPFalse(t *testing.T) {
+	nodes := []model.NodeIR{
+		model.NormalizeNode(model.NodeIR{
+			Name:   "socks",
+			Type:   model.ProtocolSOCKS5,
+			Server: "socks.example.com",
+			Port:   1080,
+			UDP:    model.Bool(false),
+		}),
+		model.NormalizeNode(model.NodeIR{
+			Name:   "http",
+			Type:   model.ProtocolHTTP,
+			Server: "http.example.com",
+			Port:   8080,
+		}),
+	}
+
+	got := applyRenderPreferences(nodes, model.RenderConfig{
+		UDP: true,
+	})
+	if len(got) != 2 {
+		t.Fatalf("applyRenderPreferences() len = %d, want 2", len(got))
+	}
+	if got[0].UDP == nil || *got[0].UDP {
+		t.Fatalf("explicit UDP false was not preserved: %#v", got[0].UDP)
+	}
+	if got[1].UDP == nil || !*got[1].UDP {
+		t.Fatalf("missing UDP should be filled from render default: %#v", got[1].UDP)
+	}
+}
+
+func TestApplyRenderPreferencesKeepsHysteriaPortSpecsWithoutSinglePort(t *testing.T) {
+	tests := []struct {
+		name     string
+		protocol model.Protocol
+		raw      map[string]interface{}
+	}{
+		{name: "hysteria ports", protocol: model.ProtocolHysteria, raw: map[string]interface{}{"ports": "20000-50000"}},
+		{name: "hysteria2 ports", protocol: model.ProtocolHysteria2, raw: map[string]interface{}{"ports": "20000-50000"}},
+		{name: "hysteria2 mport", protocol: model.ProtocolHysteria2, raw: map[string]interface{}{"mport": "20000-50000"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			node := model.NormalizeNode(model.NodeIR{
+				Name:   tt.name,
+				Type:   tt.protocol,
+				Server: "hy.example.com",
+				Auth:   model.Auth{Password: "secret"},
+				Raw:    tt.raw,
+			})
+
+			got := applyRenderPreferences([]model.NodeIR{node}, model.RenderConfig{FilterIllegal: true})
+			if len(got) != 1 {
+				t.Fatalf("applyRenderPreferences() len = %d, want port-hopping node preserved", len(got))
+			}
+		})
+	}
+
+	invalid := model.NormalizeNode(model.NodeIR{
+		Name:   "hysteria2 missing ports",
+		Type:   model.ProtocolHysteria2,
+		Server: "hy.example.com",
+		Auth:   model.Auth{Password: "secret"},
+	})
+	if got := applyRenderPreferences([]model.NodeIR{invalid}, model.RenderConfig{FilterIllegal: true}); len(got) != 0 {
+		t.Fatalf("applyRenderPreferences() = %#v, want node without port or port spec filtered", got)
+	}
+}

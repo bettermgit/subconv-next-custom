@@ -1,0 +1,14 @@
+/subconv-next
+dist/
+data/
+checksums.txt
+/artifacts/
+.env
+.local-dev/
+.tmpinspect/
+
+# local runtime / tooling (never upload)
+.tools/
+*.log
+config/config.local.json
+.askpass.bat

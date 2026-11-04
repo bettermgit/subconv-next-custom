@@ -1,0 +1,762 @@
+package static
+
+import (
+	"os"
+	"strings"
+	"testing"
+)
+
+func readAppJS(t *testing.T) string {
+	t.Helper()
+	data, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatalf("ReadFile(app.js) error = %v", err)
+	}
+	return string(data)
+}
+
+func readLoginJS(t *testing.T) string {
+	t.Helper()
+	data, err := os.ReadFile("login.js")
+	if err != nil {
+		t.Fatalf("ReadFile(login.js) error = %v", err)
+	}
+	return string(data)
+}
+
+func TestLoginRedirectRequiresParsedSameOriginURL(t *testing.T) {
+	login := readLoginJS(t)
+	for _, needle := range []string{
+		"new URL(candidate, window.location.origin)",
+		"target.origin !== window.location.origin",
+		"target.pathname.startsWith(\"/login\")",
+	} {
+		if !strings.Contains(login, needle) {
+			t.Fatalf("login.js missing same-origin redirect guard %q", needle)
+		}
+	}
+	if strings.Contains(login, "candidate.startsWith(\"/\")") {
+		t.Fatal("login.js still relies on a string-prefix redirect check")
+	}
+}
+
+func TestLocalDraftDoesNotPersistFullSubscriptionTokenOrURL(t *testing.T) {
+	app := readAppJS(t)
+
+	required := []string{
+		"function draftPublishRefFromPublished",
+		"publish_id: publishID",
+		"token_hint:",
+		"updated_at:",
+		"payload.publish_ref = publishRef",
+		"access_token: \"\"",
+		"subscription_token: \"\"",
+	}
+	for _, needle := range required {
+		if !strings.Contains(app, needle) {
+			t.Fatalf("app.js missing %q", needle)
+		}
+	}
+
+	draftRefStart := strings.Index(app, "function draftPublishRefFromPublished")
+	draftRefEnd := strings.Index(app[draftRefStart:], "\n}\n")
+	if draftRefStart < 0 || draftRefEnd < 0 {
+		t.Fatalf("draftPublishRefFromPublished function not found")
+	}
+	draftRefBody := app[draftRefStart : draftRefStart+draftRefEnd]
+	for _, forbidden := range []string{"subscription_url", ".url", "token:"} {
+		if strings.Contains(draftRefBody, forbidden) {
+			t.Fatalf("draftPublishRefFromPublished persists forbidden %q:\n%s", forbidden, draftRefBody)
+		}
+	}
+}
+
+func TestRestoreFromPublishedLinkDoesNotPersistFullPublishedURL(t *testing.T) {
+	app := readAppJS(t)
+
+	required := []string{
+		"restore-from-published",
+		"function restoreWorkspaceFromPublishedLink",
+		"function buildRestoredPublishedDraftPayload",
+		"draftPublishRefFromPublished(published)",
+		"restore-published-url-input",
+	}
+	for _, needle := range required {
+		if !strings.Contains(app, needle) {
+			t.Fatalf("app.js missing restore-from-published marker %q", needle)
+		}
+	}
+
+	payloadStart := strings.Index(app, "function buildRestoredPublishedDraftPayload")
+	payloadEnd := strings.Index(app[payloadStart:], "\n}\n")
+	if payloadStart < 0 || payloadEnd < 0 {
+		t.Fatalf("buildRestoredPublishedDraftPayload function not found")
+	}
+	payloadBody := app[payloadStart : payloadStart+payloadEnd]
+	for _, forbidden := range []string{"subscription_url", ".url", "publishedURL"} {
+		if strings.Contains(payloadBody, forbidden) {
+			t.Fatalf("buildRestoredPublishedDraftPayload persists forbidden %q:\n%s", forbidden, payloadBody)
+		}
+	}
+}
+
+func TestRestoreFromPublishedDoesNotUseBrowserConfirm(t *testing.T) {
+	app := readAppJS(t)
+
+	required := []string{
+		"async function restoreWorkspaceFromPublishedLink",
+		"findLocalDraftByPublishID(response.publish?.publish_id)",
+		"已从订阅链接恢复为新的本机草稿。",
+		"已从订阅链接更新已有本机草稿。",
+	}
+	for _, needle := range required {
+		if !strings.Contains(app, needle) {
+			t.Fatalf("app.js missing restore confirm guard %q", needle)
+		}
+	}
+
+	restoreStart := strings.Index(app, "async function restoreWorkspaceFromPublishedLink")
+	restoreEnd := strings.Index(app[restoreStart:], "\n}\n")
+	if restoreStart < 0 || restoreEnd < 0 {
+		t.Fatalf("restoreWorkspaceFromPublishedLink function not found")
+	}
+	restoreBody := app[restoreStart : restoreStart+restoreEnd]
+	if strings.Contains(restoreBody, "window.confirm") {
+		t.Fatalf("restoreWorkspaceFromPublishedLink should not use browser confirm:\n%s", restoreBody)
+	}
+}
+
+func TestPublicConverterHidesPublishedLinkRecovery(t *testing.T) {
+	app := readAppJS(t)
+
+	for _, needle := range []string{
+		"const restorePublishedButton = state.publicConverter",
+		"if (state.publicConverter) {\n    showToast(\"公网模式不支持从发布链接恢复源配置。\", true);",
+		"state.publicConverter ? \"可将当前配置另存为本机草稿。\"",
+	} {
+		if !strings.Contains(app, needle) {
+			t.Fatalf("app.js missing public restore guard %q", needle)
+		}
+	}
+}
+
+func TestMultipleLocalDraftStorageHooksExist(t *testing.T) {
+	app := readAppJS(t)
+
+	required := []string{
+		"const LOCAL_DRAFTS_STORAGE_KEY = \"SUBCONV_LOCAL_DRAFTS\"",
+		"function loadDraftStore",
+		"function saveLocalDraftPayload",
+		"function loadLocalDrafts",
+		"function renderDraftManager",
+		"draft-manager-dialog",
+		"localStorage.removeItem(LOCAL_DRAFT_STORAGE_KEY)",
+	}
+	for _, needle := range required {
+		if !strings.Contains(app, needle) {
+			t.Fatalf("app.js missing multiple-draft hook %q", needle)
+		}
+	}
+
+	if strings.Contains(app, "localStorage.setItem(LOCAL_DRAFT_STORAGE_KEY") {
+		t.Fatalf("app.js should not write new drafts to legacy single-draft key")
+	}
+}
+
+func TestSubscriptionLANAllowHooksExist(t *testing.T) {
+	app := readAppJS(t)
+
+	required := []string{
+		"function isPrivateSubscriptionURL",
+		"function sourceLANWarning",
+		"data-sub-field=\"allow_lan\"",
+		"允许局域网订阅地址",
+		"allow_lan: item.allow_lan === true",
+	}
+	for _, needle := range required {
+		if !strings.Contains(app, needle) {
+			t.Fatalf("app.js missing LAN subscription hook %q", needle)
+		}
+	}
+}
+
+func TestSubscriptionURLTypingKeepsInputMounted(t *testing.T) {
+	app := readAppJS(t)
+	for _, needle := range []string{
+		"function renderSourceRowMeta",
+		"function updateSubscriptionRowMeta",
+		"updateSubscriptionRowMeta(index);",
+		"data-source-meta-index=",
+	} {
+		if !strings.Contains(app, needle) {
+			t.Fatalf("app.js missing stable subscription URL input hook %q", needle)
+		}
+	}
+}
+
+func TestGenerationErrorStateIsActionable(t *testing.T) {
+	app := readAppJS(t)
+	index, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatalf("ReadFile(index.html) error = %v", err)
+	}
+
+	for _, needle := range []string{
+		"function describeGenerationError",
+		"订阅地址无法访问",
+		"订阅域名无法解析",
+		"function focusSubscriptionSources",
+		"function focusGenerationError",
+		"viewButton.disabled = !hasResult",
+	} {
+		if !strings.Contains(app, needle) {
+			t.Fatalf("app.js missing actionable error-state hook %q", needle)
+		}
+	}
+
+	indexText := string(index)
+	for _, id := range []string{
+		"result-error-card",
+		"result-error-title",
+		"result-error-description",
+		"review-error-source-btn",
+		"open-error-diagnostics-btn",
+	} {
+		if !strings.Contains(indexText, `id="`+id+`"`) {
+			t.Fatalf("index.html missing error-state element %q", id)
+		}
+	}
+}
+
+func TestGenerationFlowHandlesDuplicateAndTransientRequests(t *testing.T) {
+	app := readAppJS(t)
+
+	for _, needle := range []string{
+		`if (state.generationInFlight)`,
+		`state.generationInFlight = true`,
+		`state.generationInFlight = false`,
+		`summaryRefreshButton.disabled = state.generationInFlight`,
+		`response?._networkError`,
+		`response?.error?.code === "REFRESH_IN_PROGRESS"`,
+		`async function recoverRunningRefresh`,
+		`_httpStatus: response.status`,
+		`_networkError: true`,
+		`请求过于频繁`,
+	} {
+		if !strings.Contains(app, needle) {
+			t.Fatalf("app.js missing resilient generation hook %q", needle)
+		}
+	}
+}
+
+func TestCustomDNSHooksExist(t *testing.T) {
+	app := readAppJS(t)
+	index, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatalf("ReadFile(index.html) error = %v", err)
+	}
+
+	requiredApp := []string{
+		"custom_dns: false",
+		"function normalizeDNSConfigForFrontend",
+		"function readDNSFormConfig",
+		"function parseNameserverPolicyText",
+		"function splitDNSListItems",
+		"splitDNSListItems(line).forEach",
+		"custom_dns: customDNS",
+		"dns: dnsConfig",
+		"custom-dns-enabled",
+	}
+	for _, needle := range requiredApp {
+		if !strings.Contains(app, needle) {
+			t.Fatalf("app.js missing custom DNS hook %q", needle)
+		}
+	}
+
+	requiredIndex := []string{
+		"id=\"dns-settings-panel\"",
+		"id=\"custom-dns-enabled\"",
+		"value=\"127.0.0.1:5335\"",
+		"value=\"198.18.0.1/16\"",
+		"id=\"dns-use-hosts\" type=\"checkbox\" checked",
+		"id=\"dns-nameserver\"",
+		">223.5.5.5\n119.29.29.29</textarea>",
+		"id=\"dns-fallback\"",
+		">https://dns.alidns.com/dns-query</textarea>",
+		"id=\"dns-nameserver-policy\"",
+	}
+	indexText := string(index)
+	for _, needle := range requiredIndex {
+		if !strings.Contains(indexText, needle) {
+			t.Fatalf("index.html missing custom DNS hook %q", needle)
+		}
+	}
+	rulePanelIndex := strings.Index(indexText, "id=\"template-mode-panel\"")
+	dnsPanelIndex := strings.Index(indexText, "id=\"dns-settings-panel\"")
+	if rulePanelIndex < 0 || dnsPanelIndex < 0 || dnsPanelIndex < rulePanelIndex {
+		t.Fatalf("dns-settings-panel should be after rule/template settings")
+	}
+}
+
+func TestCustomRulePayloadRepairHooksExist(t *testing.T) {
+	app := readAppJS(t)
+	required := []string{
+		"function splitConcatenatedCustomRulePayloadLine",
+		"CUSTOM_RULE_PAYLOAD_PREFIXES",
+		"CUSTOM_RULE_PAYLOAD_NO_SPLIT_PREFIXES",
+		"处粘连已拆分",
+		"行无效或注释",
+		"条重复",
+	}
+	for _, needle := range required {
+		if !strings.Contains(app, needle) {
+			t.Fatalf("app.js missing custom-rule payload repair hook %q", needle)
+		}
+	}
+}
+
+func TestCustomRuleEditorInitialVisibility(t *testing.T) {
+	app := readAppJS(t)
+	index, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatalf("ReadFile(index.html) error = %v", err)
+	}
+
+	if !strings.Contains(app, "resetCustomRuleForm();\n  switchWorkspace(\"config\")") {
+		t.Fatalf("app.js must reset the custom-rule editor during initial state setup")
+	}
+	if !strings.Contains(app, "if (!isBuiltin) {\n    syncCustomRuleFormVisibility();") {
+		t.Fatalf("app.js must synchronize custom-rule fields when entering the custom tab")
+	}
+
+	indexText := string(index)
+	for _, id := range []string{
+		"custom-rule-target-group-wrap",
+		"custom-rule-url-wrap",
+		"custom-rule-path-wrap",
+		"custom-rule-interval-wrap",
+	} {
+		needle := "class=\"field hidden\" id=\"" + id + "\""
+		if !strings.Contains(indexText, needle) {
+			t.Fatalf("index.html field %q must be hidden before JavaScript initialization", id)
+		}
+	}
+}
+
+func TestCustomRuleTargetModeDoesNotPersistHiddenGroup(t *testing.T) {
+	app := readAppJS(t)
+	required := []string{
+		"getValue(\"custom-rule-target-mode\") !== \"existing_group\"",
+		"setValue(\"custom-rule-target-group\", \"\")",
+		"const targetGroup = targetMode === \"existing_group\"",
+	}
+	for _, needle := range required {
+		if !strings.Contains(app, needle) {
+			t.Fatalf("app.js missing custom-rule target cleanup hook %q", needle)
+		}
+	}
+	if strings.Contains(app, "targetMode = \"new_group\"") {
+		t.Fatalf("app.js must not rewrite existing-group selection to new_group")
+	}
+}
+
+func TestRestoreFromPublishedDedupesByPublishID(t *testing.T) {
+	app := readAppJS(t)
+
+	required := []string{
+		"function findLocalDraftByPublishID",
+		"existingDraft?.draft_id || createLocalDraftID()",
+		"preservedLocalDraftName(existingDraft)",
+		"draftID: existingDraft?.draft_id || draft.draft_id",
+	}
+	for _, needle := range required {
+		if !strings.Contains(app, needle) {
+			t.Fatalf("app.js missing published-link dedupe marker %q", needle)
+		}
+	}
+}
+
+func TestLocalDraftAutoNameFiltersDefaultSourceNames(t *testing.T) {
+	app := readAppJS(t)
+
+	required := []string{
+		"function preservedLocalDraftName",
+		"function isGenericLocalDraftName",
+		"/^source-\\d+$/i.test(value)",
+		"function localDraftSubscriptionLabel",
+		"subscriptionURLHostLabel(item?.url)",
+		"function formatDraftNameTime",
+		"`${baseName} · ${timeLabel}`",
+	}
+	for _, needle := range required {
+		if !strings.Contains(app, needle) {
+			t.Fatalf("app.js missing local-draft naming marker %q", needle)
+		}
+	}
+}
+
+func TestSourceModeIsMutuallyExclusiveInGeneratedConfig(t *testing.T) {
+	app := readAppJS(t)
+
+	required := []string{
+		"function switchSourceMode(mode)",
+		"const nextMode = mode === \"template\" ? \"template\" : \"rules\"",
+		"state.activeSourceMode = nextMode",
+		"state.activeSourceMode === \"template\" ? \"template\" : \"rules\"",
+		"source_mode: activeMode",
+		"template_rule_mode: activeMode",
+		"!activeOnly || activeMode === \"template\"",
+		"!activeOnly || activeMode === \"rules\"",
+	}
+	for _, needle := range required {
+		if !strings.Contains(app, needle) {
+			t.Fatalf("app.js missing source-mode guard %q", needle)
+		}
+	}
+}
+
+func TestRuleModeDefaultsToBalanced(t *testing.T) {
+	app := readAppJS(t)
+
+	required := []string{
+		`rule_mode: "balanced"`,
+		"enabled_rules: RULE_PRESETS.balanced",
+		"state.ruleMode = DEFAULT_RENDER.rule_mode",
+		"RULE_PRESETS[state.ruleMode] || RULE_PRESETS.custom",
+	}
+	for _, needle := range required {
+		if !strings.Contains(app, needle) {
+			t.Fatalf("app.js missing balanced rule-mode default %q", needle)
+		}
+	}
+}
+
+func TestManualNodeUIStateHooksExist(t *testing.T) {
+	app := readAppJS(t)
+
+	required := []string{
+		"function renderInlineManager()",
+		"manual-node-status",
+		"已解析 ·",
+		"解析失败",
+		"已禁用",
+		"function previewInlineEntry",
+		"function validateManualNodesBeforeGenerate",
+		"data-inline-action=\"preview\"",
+		"data-inline-action=\"clear\"",
+		"data-inline-action=\"delete\"",
+	}
+	for _, needle := range required {
+		if !strings.Contains(app, needle) {
+			t.Fatalf("app.js missing manual-node hook %q", needle)
+		}
+	}
+}
+
+func TestNodeEditorCacheInvalidatesAfterGenerate(t *testing.T) {
+	app := readAppJS(t)
+
+	required := []string{
+		"nodeCacheStale: false",
+		"if (state.nodeCacheStale || !state.allNodes.length) loadNodes();",
+		"function markNodeCacheStale()",
+		"markNodeCacheStale();",
+		"state.nodeCacheStale = false;",
+	}
+	for _, needle := range required {
+		if !strings.Contains(app, needle) {
+			t.Fatalf("app.js missing node-cache invalidation marker %q", needle)
+		}
+	}
+}
+
+func TestNodeEditorBulkDeleteHooksExist(t *testing.T) {
+	app := readAppJS(t)
+
+	required := []string{
+		"function renderNodeBulkActionBar",
+		"bulk-delete-selected-nodes-btn",
+		"bulk-delete-current-filter-btn",
+		"function openBulkDeleteDialog",
+		"function performBulkDeleteNodes",
+		"const ok = await performBulkDeleteNodes(config.nodes || config.nodeIds || [])",
+		"nodes: targets",
+		"function normalizeBulkDeleteTargets",
+		"action: \"bulk-delete-nodes\"",
+		"fetchJSON(\"/api/nodes/delete\"",
+		"`/api/nodes/custom/${encodeURIComponent(nodeId)}`",
+	}
+	for _, needle := range required {
+		if !strings.Contains(app, needle) {
+			t.Fatalf("app.js missing bulk-delete hook %q", needle)
+		}
+	}
+}
+
+func TestNodeEditorDeletedRestoreHooksExist(t *testing.T) {
+	app := readAppJS(t)
+
+	required := []string{
+		"restore-deleted-nodes-btn",
+		"restore-deleted-dialog",
+		"function openDeletedNodesDialog",
+		"fetchJSON(\"/api/nodes/deleted\")",
+		"data-restore-deleted-node",
+		"function renderDeletedNodesDialog",
+		"function restoreAllDeletedNodesFromDialog",
+		"function restoreDeletedNodes",
+		"fetchJSON(\"/api/nodes/enable\"",
+	}
+	for _, needle := range required {
+		if !strings.Contains(app, needle) {
+			t.Fatalf("app.js missing deleted-node restore hook %q", needle)
+		}
+	}
+}
+
+func TestLocalDraftPrunesDeletedNodesFromRemovedSubscriptions(t *testing.T) {
+	app := readAppJS(t)
+
+	required := []string{
+		"deleted_node_sources:",
+		"function pruneLocalDraftDeletedNodes",
+		"!sources.some((sourceID) => activeSources.has(sourceID))",
+		"delete sanitized.deleted_node_sources[nodeID]",
+	}
+	for _, needle := range required {
+		if !strings.Contains(app, needle) {
+			t.Fatalf("app.js missing deleted-node source cleanup marker %q", needle)
+		}
+	}
+}
+
+func TestNodeEditorPerformanceHooksExist(t *testing.T) {
+	app := readAppJS(t)
+
+	required := []string{
+		"nodeById: new Map()",
+		"function buildNodeIndexes",
+		"node._searchText = buildNodeSearchText(node)",
+		"function bindNodeTableDelegates",
+		"body.dataset.delegatesBound === \"1\"",
+		"function refreshNodeSelectionUI",
+		"function buildNodeQueryParams",
+		"function loadAllFilteredNodes",
+		"state.selectedNodeCache.set(node.id, node)",
+		"const localNode = state.nodeById.get(nodeId)",
+	}
+	for _, needle := range required {
+		if !strings.Contains(app, needle) {
+			t.Fatalf("app.js missing node editor performance hook %q", needle)
+		}
+	}
+
+	openStart := strings.Index(app, "async function openNodeDialog")
+	openEnd := strings.Index(app[openStart:], "\n}\n")
+	if openStart < 0 || openEnd < 0 {
+		t.Fatalf("openNodeDialog function not found")
+	}
+	openBody := app[openStart : openStart+openEnd]
+	if strings.Contains(openBody, "state.allNodes.find") || strings.Contains(openBody, "state.nodes.find") {
+		t.Fatalf("openNodeDialog should use indexed lookup instead of scanning nodes:\n%s", openBody)
+	}
+}
+
+func TestEmojiSourceNamePreviewMatchesDefaultNaming(t *testing.T) {
+	app := readAppJS(t)
+
+	required := []string{
+		"source_prefix_mode: \"emoji_name\"",
+		"const SOURCE_PREFIX_SEPARATOR = \"｜\"",
+		"function buildSourcePrefix",
+		"if (emoji && sourceName) return `${emoji} ${sourceName}`",
+		"return `${prefix}${SOURCE_PREFIX_SEPARATOR}${SOURCE_NAME_PREVIEW}`",
+		"function sourceNamePreviewLabel",
+		"`命名预览：${sourceNamePreview(item)}`",
+	}
+	for _, needle := range required {
+		if !strings.Contains(app, needle) {
+			t.Fatalf("app.js missing naming preview guard %q", needle)
+		}
+	}
+}
+
+func TestBuiltinRulesExposeOneDriveSeparately(t *testing.T) {
+	app := readAppJS(t)
+
+	required := []string{
+		`{ key: "onedrive", label: "微软云盘" }`,
+		`onedrive: "cloud"`,
+	}
+	for _, needle := range required {
+		if !strings.Contains(app, needle) {
+			t.Fatalf("app.js missing OneDrive rule UI marker %q", needle)
+		}
+	}
+
+	oneDrivePos := strings.Index(app, `"onedrive"`)
+	microsoftPos := strings.Index(app, `"microsoft"`)
+	if oneDrivePos < 0 || microsoftPos < 0 || oneDrivePos > microsoftPos {
+		t.Fatalf("OneDrive rule should be listed before Microsoft rule")
+	}
+}
+
+func TestBuiltinRulesExposeAethersailorAdditions(t *testing.T) {
+	app := readAppJS(t)
+
+	for _, marker := range []string{
+		`{ key: "aethersailor_direct", label: "上游专项规则" }`,
+		`{ key: "ai_extended", label: "扩展 AI 服务" }`,
+		`{ key: "game_direct", label: "游戏 CDN 直连" }`,
+		`{ key: "communication", label: "即时通讯" }`,
+		`{ key: "google_fcm", label: "谷歌 FCM" }`,
+		`{ key: "gfw", label: "GFW 代理" }`,
+		`{ key: "nonstandard_port", label: "非标端口" }`,
+		`full: BUILTIN_RULES.map((item) => item.key)`,
+	} {
+		if !strings.Contains(app, marker) {
+			t.Fatalf("app.js missing upstream rule UI marker %q", marker)
+		}
+	}
+}
+
+func TestCustomRulesUseGlobalRuleLibrary(t *testing.T) {
+	app := readAppJS(t)
+
+	// Custom rules are a server-wide library, never workspace state.
+	for _, marker := range []string{
+		"async function loadGlobalRules",
+		"async function createGlobalRule",
+		"async function updateGlobalRule",
+		"async function removeGlobalRuleByKey",
+		"async function toggleGlobalRuleEnabled",
+		"function isGlobalCustomRuleKey",
+		"void migrateLegacyWorkspaceRules(render.custom_rules)",
+		`fetchJSON("/api/global-rules", {`,
+		"/api/global-rules/${encodeURIComponent(rule.key)}",
+		"/api/global-rules/${encodeURIComponent(key)}",
+		"custom_rules: [],",
+		"base.render.custom_rules = [];",
+	} {
+		if !strings.Contains(app, marker) {
+			t.Fatalf("app.js missing global rule library marker %q", marker)
+		}
+	}
+
+	// Global CRUD entry points must write through to the global API.
+	for _, tc := range []struct{ fn, needle string }{
+		{"async function saveCustomRuleFromDialogAsync", "createGlobalRule"},
+		{"async function deleteCustomRuleAsync", "removeGlobalRuleByKey"},
+		{"async function addMRSQuickAddRules", "createGlobalRule"},
+		{"function toggleRule(ruleKey)", "isGlobalCustomRuleKey"},
+	} {
+		start := strings.Index(app, tc.fn)
+		if start < 0 {
+			t.Fatalf("app.js missing %s", tc.fn)
+		}
+		end := strings.Index(app[start:], "\n}\n")
+		if end < 0 {
+			t.Fatalf("app.js %s body not found", tc.fn)
+		}
+		if !strings.Contains(app[start:start+end], tc.needle) {
+			t.Fatalf("%s does not go through %s", tc.fn, tc.needle)
+		}
+	}
+
+	// Workspace-level rule settings (presets, additional rules, enablement)
+	// must still persist to the workspace config.
+	for _, fn := range []string{
+		"function applyRulePreset",
+		"function updateAdditionalRulesFromInput",
+	} {
+		start := strings.Index(app, fn)
+		if start < 0 {
+			t.Fatalf("app.js missing %s", fn)
+		}
+		end := strings.Index(app[start:], "\n}\n")
+		if end < 0 {
+			t.Fatalf("app.js %s body not found", fn)
+		}
+		body := app[start : start+end]
+		if !strings.Contains(body, "scheduleRulePersist(") {
+			t.Fatalf("%s does not persist rule state to the server", fn)
+		}
+	}
+}
+
+func TestMRSQuickAddRulesUIExists(t *testing.T) {
+	app := readAppJS(t)
+
+	for _, marker := range []string{
+		"function parseMRSQuickAddEntries",
+		"function mrsRuleNameFromURL",
+		"function uniqueCustomRuleKey",
+		"async function addMRSQuickAddRules",
+		`getElementById("mrs-quick-add-btn")`,
+		`source_type: "http"`,
+		`insert_position: "before_match"`,
+		"normalizeRemoteRuleProviderShape",
+	} {
+		if !strings.Contains(app, marker) {
+			t.Fatalf("app.js missing mrs quick-add marker %q", marker)
+		}
+	}
+}
+
+func TestWorkspaceSessionReusedAcrossReloads(t *testing.T) {
+	app := readAppJS(t)
+
+	for _, marker := range []string{
+		`const PERSISTED_WORKSPACE_KEY = "SUBCONV_PERSISTED_WORKSPACE"`,
+		"function persistedWorkspaceID",
+		"function rememberPersistedWorkspace",
+		"function forgetPersistedWorkspace",
+		"async function adoptExistingWorkspace",
+		"await adoptExistingWorkspace(storedWorkspaceID)",
+		"rememberPersistedWorkspace(state.workspaceId)",
+	} {
+		if !strings.Contains(app, marker) {
+			t.Fatalf("app.js missing workspace reuse marker %q", marker)
+		}
+	}
+
+	// A deleted workspace must not be reused, and opening a publication
+	// workspace must become the persisted one.
+	clearStart := strings.Index(app, "async function clearCurrentSession")
+	if clearStart < 0 {
+		t.Fatal("app.js missing clearCurrentSession")
+	}
+	clearBody := app[clearStart : clearStart+strings.Index(app[clearStart:], "\n}\n")]
+	if !strings.Contains(clearBody, "forgetPersistedWorkspace()") {
+		t.Fatal("clearCurrentSession must forget the persisted workspace id")
+	}
+	openStart := strings.Index(app, "async function openPublicationWorkspace")
+	if openStart < 0 {
+		t.Fatal("app.js missing openPublicationWorkspace")
+	}
+	openBody := app[openStart : openStart+strings.Index(app[openStart:], "\n}\n")]
+	if !strings.Contains(openBody, "rememberPersistedWorkspace(workspaceId)") {
+		t.Fatal("openPublicationWorkspace must persist the adopted workspace id")
+	}
+}
+
+func TestPresetManualAddButtonOpensCustomRuleEditor(t *testing.T) {
+	htmlData, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatalf("ReadFile(index.html) error = %v", err)
+	}
+	html := string(htmlData)
+	if !strings.Contains(html, `id="preset-add-rule-btn"`) {
+		t.Fatal("index.html missing manual-add preset button")
+	}
+
+	app := readAppJS(t)
+	start := strings.Index(app, `getElementById("preset-add-rule-btn")`)
+	if start < 0 {
+		t.Fatal("app.js does not bind the manual-add preset button")
+	}
+	binding := app[start : start+400]
+	if !strings.Contains(binding, "openCustomRuleDialog()") {
+		t.Fatalf("manual-add preset button must open the custom rule editor, got: %s", binding)
+	}
+}

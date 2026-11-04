@@ -1,0 +1,574 @@
+package api
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	staticui "subconv-next/internal/api/static"
+	"subconv-next/internal/model"
+)
+
+type Server struct {
+	version string
+
+	mu                sync.RWMutex
+	config            model.Config
+	status            model.RuntimeStatus
+	logLines          []string
+	workspaceStatus   map[string]model.RuntimeStatus
+	workspaceLogs     map[string][]string
+	workspaceCreateMu sync.Mutex
+	workspaceMetaMu   sync.Mutex
+	workspaceLocks    workspaceLockManager
+	maxWorkspaces     int
+	publishedCreateMu sync.Mutex
+	maxPublications   int
+	logWriteMu        sync.Mutex
+
+	refreshMu    sync.Mutex
+	refreshRuns  map[string]chan struct{}
+	refreshSlots chan struct{}
+
+	publishedMetaMu      sync.Mutex
+	publishedIndexMu     sync.RWMutex
+	publishedTokenIndex  map[string]string
+	publishedIndexLoaded bool
+	publishedAccessMu    sync.Mutex
+	publishedAccess      map[string]*publishedAccessState
+
+	siteLogoMu    sync.RWMutex
+	siteLogoCache map[string]siteLogoCacheEntry
+
+	refreshBeforeRun  func()
+	refreshAfterRun   func()
+	refreshAfterWrite func(path string)
+}
+
+func NewServer(version string, cfg model.Config) *Server {
+	now := time.Now().UTC()
+
+	maxWorkspaces := cfg.Service.MaxWorkspaces
+	if maxWorkspaces <= 0 {
+		maxWorkspaces = model.DefaultMaxWorkspaces
+	}
+	maxPublications := cfg.Service.MaxPublications
+	if maxPublications <= 0 {
+		maxPublications = model.DefaultMaxPublications
+	}
+	maxRefreshWorkers := cfg.Service.MaxConcurrentRefreshes
+	if maxRefreshWorkers <= 0 {
+		maxRefreshWorkers = model.DefaultMaxRefreshWorkers
+	}
+
+	return &Server{
+		version: version,
+		config:  cfg,
+		status: model.RuntimeStatus{
+			StartedAt:                now,
+			Running:                  true,
+			EnabledSubscriptionCount: enabledSubscriptionCount(cfg.Subscriptions),
+			UpstreamSourceCount:      enabledSubscriptionCount(cfg.Subscriptions),
+			RefreshInterval:          effectiveRefreshInterval(cfg),
+			NextRefreshAt:            nextRefreshTime(now, cfg),
+			OutputPath:               cfg.Service.OutputPath,
+			YAMLExists:               yamlFileExists(cfg.Service.OutputPath),
+			YAMLUpdatedAt:            yamlFileUpdatedAt(cfg.Service.OutputPath),
+		},
+		siteLogoCache:       map[string]siteLogoCacheEntry{},
+		workspaceStatus:     map[string]model.RuntimeStatus{},
+		workspaceLogs:       map[string][]string{},
+		refreshRuns:         map[string]chan struct{}{},
+		refreshSlots:        make(chan struct{}, maxRefreshWorkers),
+		maxWorkspaces:       maxWorkspaces,
+		maxPublications:     maxPublications,
+		publishedTokenIndex: map[string]string{},
+		publishedAccess:     map[string]*publishedAccessState{},
+	}
+}
+
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", s.handleHealthz)
+	mux.HandleFunc("/api/auth/session", s.handleAuthSession)
+	mux.HandleFunc("/api/auth/login", s.handleAuthLogin)
+	mux.HandleFunc("/api/auth/logout", s.handleAuthLogout)
+	mux.HandleFunc("/api/status", s.handleStatus)
+	mux.HandleFunc("/api/workspaces", s.handleWorkspaces)
+	mux.HandleFunc("/api/workspaces/", s.handleWorkspaceSubroutes)
+	mux.HandleFunc("/api/published", s.handlePublished)
+	mux.HandleFunc("/api/published/", s.handlePublishedSubroutes)
+	mux.HandleFunc("/api/publications", s.handlePublications)
+	mux.HandleFunc("/api/publications/", s.handlePublicationSubroutes)
+	mux.HandleFunc("/api/config", s.handleConfig)
+	mux.HandleFunc("/api/global-rules", s.handleGlobalRules)
+	mux.HandleFunc("/api/global-rules/", s.handleGlobalRuleSubroutes)
+	mux.HandleFunc("/api/site-logo", s.handleSiteLogo)
+	mux.HandleFunc("/api/subscription-meta", s.handleSubscriptionMeta)
+	mux.HandleFunc("/api/audit", s.handleAudit)
+	mux.HandleFunc("/api/preview-yaml", s.handlePreviewYAML)
+	mux.HandleFunc("/api/validate-output", s.handleValidateOutput)
+	mux.HandleFunc("/api/nodes", s.handleNodes)
+	mux.HandleFunc("/api/nodes/", s.handleNodeSubroutes)
+	mux.HandleFunc("/api/parse", s.handleParse)
+	mux.HandleFunc("/api/generate", s.handleGenerate)
+	mux.HandleFunc("/api/refresh", s.handleRefresh)
+	mux.HandleFunc("/api/logs", s.handleLogs)
+	mux.HandleFunc("/api/update-check", s.handleUpdateCheck)
+	mux.HandleFunc("/s/", s.handlePublishedSubscriptionYAML)
+	mux.HandleFunc("/sub/mihomo.yaml", s.handleDeprecatedSubscriptionYAML)
+	mux.HandleFunc("/favicon.svg", serveEmbeddedAsset("favicon.svg", "image/svg+xml"))
+	mux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			methodNotAllowed(w, http.MethodGet+", "+http.MethodHead)
+			return
+		}
+		http.Redirect(w, r, "/favicon.svg", http.StatusTemporaryRedirect)
+	})
+	mux.HandleFunc("/style.css", serveEmbeddedAsset("style.css", "text/css; charset=utf-8"))
+	mux.HandleFunc("/app.js", serveEmbeddedAsset("app.js", "application/javascript; charset=utf-8"))
+	mux.HandleFunc("/login.css", serveEmbeddedAsset("login.css", "text/css; charset=utf-8"))
+	mux.HandleFunc("/login.js", serveEmbeddedAsset("login.js", "application/javascript; charset=utf-8"))
+	mux.HandleFunc("/login", s.handleLoginPage)
+	mux.HandleFunc("/login.html", func(w http.ResponseWriter, r *http.Request) {
+		if s.snapshotConfig().Service.PublicConverter {
+			http.Redirect(w, r, "/", http.StatusFound)
+			return
+		}
+		http.Redirect(w, r, "/login", http.StatusMovedPermanently)
+	})
+	mux.HandleFunc("/", serveIndex)
+	return s.recoveryMiddleware(s.securityMiddleware(s.workspaceLockMiddleware(mux)))
+}
+
+func ListenAddress(cfg model.Config) string {
+	return net.JoinHostPort(cfg.Service.ListenAddr, strconv.Itoa(cfg.Service.ListenPort))
+}
+
+func (s *Server) snapshotStatus() model.RuntimeStatus {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.status
+}
+
+func (s *Server) snapshotConfig() model.Config {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.config
+}
+
+func (s *Server) appendLog(message string) {
+	if message == "" {
+		return
+	}
+	line := fmt.Sprintf("%s %s", time.Now().UTC().Format(time.RFC3339), maskSensitiveText(message))
+	s.mu.Lock()
+	s.logLines = append(s.logLines, line)
+	if len(s.logLines) > 500 {
+		s.logLines = append([]string(nil), s.logLines[len(s.logLines)-500:]...)
+	}
+	s.mu.Unlock()
+	s.writeLogLine(line)
+}
+
+func (s *Server) snapshotLogs(tail int) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if tail <= 0 || tail >= len(s.logLines) {
+		return maskLogLines(s.logLines)
+	}
+	return maskLogLines(s.logLines[len(s.logLines)-tail:])
+}
+
+func (s *Server) snapshotWorkspaceLogs(workspaceHash string, tail int) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	lines := s.workspaceLogs[workspaceHash]
+	if tail <= 0 || tail >= len(lines) {
+		return maskLogLines(lines)
+	}
+	return maskLogLines(lines[len(lines)-tail:])
+}
+
+// maskWorkspaceLogPaths hides server filesystem paths from workspace-facing
+// logs, which anonymous public-mode workspace holders can read.
+var workspaceLogPathPattern = regexp.MustCompile(`(^|[\s"'(=])((?:/[A-Za-z0-9._-]+){2,})`)
+
+func maskWorkspaceLogPaths(value string) string {
+	return workspaceLogPathPattern.ReplaceAllString(value, "$1[redacted-path]")
+}
+
+func (s *Server) appendWorkspaceLog(workspaceHash, message string) {
+	if strings.TrimSpace(workspaceHash) == "" || message == "" {
+		return
+	}
+	line := fmt.Sprintf("%s %s", time.Now().UTC().Format(time.RFC3339), maskSensitiveText(maskWorkspaceLogPaths(message)))
+	s.mu.Lock()
+	lines := append(s.workspaceLogs[workspaceHash], line)
+	if len(lines) > 500 {
+		lines = append([]string(nil), lines[len(lines)-500:]...)
+	}
+	s.workspaceLogs[workspaceHash] = lines
+	s.mu.Unlock()
+	s.writeLogLine("workspace=" + shortNodeID(workspaceHash) + " " + line)
+}
+
+func (s *Server) snapshotWorkspaceStatus(workspaceHash string) model.RuntimeStatus {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.workspaceStatus[workspaceHash]
+}
+
+func (s *Server) setWorkspaceStatus(workspaceHash string, status model.RuntimeStatus) {
+	if strings.TrimSpace(workspaceHash) == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.workspaceStatus[workspaceHash] = status
+}
+
+func (s *Server) setRefreshSuccess(nodeCount int, nodeNames []string, outputPath string, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.status.Running = true
+	s.status.LastRefreshAt = at
+	s.status.LastSuccessAt = at
+	s.status.NextRefreshAt = nextRefreshTime(at, s.config)
+	s.status.NodeCount = nodeCount
+	s.status.NodeNames = append([]string(nil), nodeNames...)
+	s.status.OutputPath = outputPath
+	s.status.YAMLExists = true
+	s.status.YAMLUpdatedAt = at
+	s.status.LastError = ""
+	s.status.RefreshStage = ""
+}
+
+func (s *Server) setRefreshFailure(message string, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.status.Running = true
+	s.status.LastRefreshAt = at
+	s.status.NextRefreshAt = nextRefreshTime(at, s.config)
+	s.status.YAMLExists = yamlFileExists(s.config.Service.OutputPath)
+	s.status.YAMLUpdatedAt = yamlFileUpdatedAt(s.config.Service.OutputPath)
+	s.status.LastError = message
+	s.status.RefreshStage = ""
+}
+
+func (s *Server) setRefreshing(refreshing bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.status.Refreshing = refreshing
+	if !refreshing {
+		s.status.RefreshStage = ""
+	}
+}
+
+func (s *Server) setRefreshStage(stage string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.status.RefreshStage = strings.TrimSpace(stage)
+}
+
+func (s *Server) uptimeSeconds() int64 {
+	startedAt := s.snapshotStatus().StartedAt
+	if startedAt.IsZero() {
+		return 0
+	}
+
+	uptime := int64(time.Since(startedAt).Seconds())
+	if uptime < 0 {
+		return 0
+	}
+	return uptime
+}
+
+const (
+	maxAppLogBytes = 5 * 1024 * 1024
+	maxAppLogFiles = 3
+)
+
+func (s *Server) writeLogLine(line string) {
+	if strings.TrimSpace(line) == "" {
+		return
+	}
+	s.logWriteMu.Lock()
+	defer s.logWriteMu.Unlock()
+
+	dir := s.logsDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return
+	}
+	path := filepath.Join(dir, "app.log")
+	if err := rotateLogFile(path, int64(len(line)+1)); err != nil {
+		return
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+	_ = file.Chmod(0o600)
+	_, _ = file.WriteString(line + "\n")
+}
+
+func rotateLogFile(path string, incomingBytes int64) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if info.Size()+incomingBytes <= maxAppLogBytes {
+		return nil
+	}
+	oldest := fmt.Sprintf("%s.%d", path, maxAppLogFiles)
+	_ = os.Remove(oldest)
+	for index := maxAppLogFiles - 1; index >= 1; index-- {
+		current := fmt.Sprintf("%s.%d", path, index)
+		next := fmt.Sprintf("%s.%d", path, index+1)
+		if _, err := os.Stat(current); err == nil {
+			_ = os.Rename(current, next)
+		}
+	}
+	return os.Rename(path, path+".1")
+}
+
+func enabledSubscriptionCount(subscriptions []model.SubscriptionConfig) int {
+	count := 0
+	for _, sub := range subscriptions {
+		if sub.Enabled {
+			count++
+		}
+	}
+	return count
+}
+
+func writeJSON(w http.ResponseWriter, statusCode int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func decodeJSONBody(r *http.Request, dst any) error {
+	defer r.Body.Close()
+
+	const maxJSONBodyBytes = int64(1 << 20)
+	limited := &io.LimitedReader{R: r.Body, N: maxJSONBodyBytes + 1}
+	dec := json.NewDecoder(limited)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		if limited.N == 0 {
+			return errors.New("decode request body: body exceeds 1 MiB limit")
+		}
+		return fmt.Errorf("decode request body: %w", err)
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return fmt.Errorf("decode request body: trailing content")
+	}
+	if limited.N == 0 {
+		return errors.New("decode request body: body exceeds 1 MiB limit")
+	}
+
+	return nil
+}
+
+func methodNotAllowed(w http.ResponseWriter, allow string) {
+	w.Header().Set("Allow", allow)
+	writeAPIError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
+}
+
+func formatTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
+func writeAPIError(w http.ResponseWriter, statusCode int, code, message string) {
+	message = maskSensitiveText(message)
+	writeJSON(w, statusCode, map[string]any{
+		"ok": false,
+		"error": map[string]string{
+			"code":    code,
+			"message": message,
+		},
+	})
+}
+
+func serveIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		methodNotAllowed(w, http.MethodGet+", "+http.MethodHead)
+		return
+	}
+	serveEmbeddedAsset("index.html", "text/html; charset=utf-8")(w, r)
+}
+
+func (s *Server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/login" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		methodNotAllowed(w, http.MethodGet+", "+http.MethodHead)
+		return
+	}
+	if s.snapshotConfig().Service.PublicConverter {
+		http.Redirect(w, r, "/", http.StatusFound)
+		return
+	}
+	serveEmbeddedAsset("login.html", "text/html; charset=utf-8")(w, r)
+}
+
+func (s *Server) recoveryMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				s.appendLog(fmt.Sprintf("request panic recovered: %v", recovered))
+				writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "request failed unexpectedly")
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+func serveEmbeddedAsset(name, contentType string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			methodNotAllowed(w, http.MethodGet+", "+http.MethodHead)
+			return
+		}
+		data, err := staticui.Assets.ReadFile(name)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Cache-Control", "no-store, max-age=0")
+		w.Header().Set("Pragma", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		if r.Method == http.MethodHead {
+			return
+		}
+		_, _ = w.Write(data)
+	}
+}
+
+func maskLogLines(lines []string) []string {
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		out = append(out, maskSensitiveText(line))
+	}
+	return out
+}
+
+var (
+	publishedPathPattern = regexp.MustCompile(`/s/[^/\s]+/[^?#\s]+`)
+	schemeSecretPattern  = regexp.MustCompile(`(?i)\b(ss|trojan|anytls|tuic|vless|vmess|wireguard|socks5|http)://([^@/\s]+)@`)
+	uuidPattern          = regexp.MustCompile(`(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b`)
+	longHexPattern       = regexp.MustCompile(`(?i)\b[0-9a-f]{64}\b`)
+	secretPairPattern    = regexp.MustCompile(`(?i)\b(password|uuid|token|private[-_ ]?key|pre[-_ ]?shared[-_ ]?key|authorization|cookie)\s*[:=]\s*[^,\s"']+`)
+)
+
+func maskSensitiveText(value string) string {
+	keys := []string{"token", "sig", "key", "auth", "password", "uuid", "private-key", "private_key", "pre-shared-key", "presharedkey", "access_token", "authorization", "cookie"}
+	masked := value
+	for _, key := range keys {
+		masked = maskQueryValue(masked, key)
+	}
+	masked = publishedPathPattern.ReplaceAllString(masked, "/s/<redacted>/<file>")
+	masked = schemeSecretPattern.ReplaceAllString(masked, `$1://***@`)
+	masked = uuidPattern.ReplaceAllString(masked, "***")
+	// Workspace/publication directories and content hashes are runtime
+	// details; mask them so API errors and logs do not disclose server layout.
+	masked = longHexPattern.ReplaceAllString(masked, "***")
+	masked = secretPairPattern.ReplaceAllStringFunc(masked, maskSecretPair)
+	masked = maskHeaderValue(masked, "authorization")
+	masked = maskHeaderValue(masked, "cookie")
+	return truncateLogText(masked, 2048)
+}
+
+func truncateLogText(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit]) + "… <truncated>"
+}
+
+func maskSecretPair(input string) string {
+	for index, r := range input {
+		if r == ':' || r == '=' {
+			return input[:index+1] + "***"
+		}
+	}
+	return input
+}
+
+func maskQueryValue(input, key string) string {
+	pattern := strings.ToLower(key) + "="
+	lower := strings.ToLower(input)
+	searchFrom := 0
+	for {
+		index := strings.Index(lower[searchFrom:], pattern)
+		if index == -1 {
+			return input
+		}
+		index += searchFrom
+		start := index + len(pattern)
+		end := start
+		for end < len(input) {
+			switch input[end] {
+			case '&', ' ', '\n', '\r', '\t', '"', '\'':
+				goto done
+			}
+			end++
+		}
+	done:
+		input = input[:start] + "***" + input[end:]
+		lower = strings.ToLower(input)
+		searchFrom = start + 3
+	}
+}
+
+func maskHeaderValue(input, key string) string {
+	lower := strings.ToLower(input)
+	pattern := strings.ToLower(key) + ":"
+	index := strings.Index(lower, pattern)
+	if index == -1 {
+		return input
+	}
+	start := index + len(pattern)
+	end := start
+	for end < len(input) {
+		switch input[end] {
+		case '\n', '\r':
+			goto done
+		}
+		end++
+	}
+done:
+	return input[:start] + " ***" + input[end:]
+}

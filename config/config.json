@@ -1,0 +1,145 @@
+{
+  "service": {
+    "enabled": true,
+    "listen_addr": "0.0.0.0",
+    "listen_port": 9876,
+    "log_level": "info",
+    "template": "standard",
+    "output_path": "/data/mihomo.yaml",
+    "cache_dir": "/data/cache",
+    "state_path": "/data/state.json",
+    "refresh_interval": 3600,
+    "refresh_on_request": true,
+    "stale_if_error": true,
+    "strict_mode": true,
+    "max_subscription_bytes": 5242880,
+    "fetch_timeout_seconds": 15,
+    "allow_lan": false
+  },
+  "subscriptions": [],
+  "inline": [],
+  "render": {
+    "mixed_port": 7897,
+    "allow_lan": true,
+    "mode": "rule",
+    "log_level": "info",
+    "ipv6": false,
+    "dns_enabled": true,
+    "enhanced_mode": "fake-ip",
+    "emoji": false,
+    "show_node_type": false,
+    "include_info_node": true,
+    "skip_tls_verify": false,
+    "udp": true,
+    "node_list": false,
+    "sort_nodes": false,
+    "filter_illegal": true,
+    "insert_url": false,
+    "group_proxy_mode": "compact",
+    "group_options": {
+      "enable_region_groups": true,
+      "rule_group_node_mode": "full",
+      "include_real_nodes_in_rule_groups": true,
+      "special_groups_use_compact": true
+    },
+    "source_prefix": true,
+    "source_prefix_format": "{emoji} {name}",
+    "source_prefix_separator": "｜",
+    "name_options": {
+      "keep_raw_name": true,
+      "source_prefix_mode": "emoji_name",
+      "source_prefix_separator": "｜",
+      "dedupe_suffix_style": "#n"
+    },
+    "dedupe_scope": "global",
+    "output_filename": "mihomo.yaml",
+    "source_mode": "rules",
+    "template_rule_mode": "rules",
+    "external_config": {
+      "template_key": "none",
+      "template_label": "跟随当前服务模板"
+    },
+    "rule_mode": "balanced",
+    "enabled_rules": [
+      "private",
+      "domestic",
+      "onedrive",
+      "microsoft",
+      "apple",
+      "google",
+      "github",
+      "ai",
+      "telegram",
+      "streaming",
+      "non_cn"
+    ],
+    "custom_rules": [],
+    "unified_delay": true,
+    "tcp_concurrent": false,
+    "find_process_mode": "strict",
+    "global_client_fingerprint": "chrome",
+    "dns": {
+      "enable": true,
+      "listen": "127.0.0.1:5335",
+      "use_hosts": true,
+      "use_system_hosts": false,
+      "respect_rules": false,
+      "enhanced_mode": "fake-ip",
+      "fake_ip_range": "198.18.0.1/16",
+      "default_nameserver": [
+        "223.5.5.5",
+        "119.29.29.29"
+      ],
+      "nameserver": [
+        "223.5.5.5",
+        "119.29.29.29"
+      ],
+      "fallback": [
+        "https://dns.alidns.com/dns-query"
+      ],
+      "fake_ip_filter": [
+        "*.lan",
+        "*.local",
+        "localhost",
+        "*.msftconnecttest.com",
+        "*.msftncsi.com",
+        "*.nintendo.net",
+        "*.playstation.net",
+        "*.xboxlive.com",
+        "stun.*",
+        "time.*"
+      ]
+    },
+    "profile": {
+      "store_selected": true,
+      "store_fake_ip": false
+    },
+    "sniffer": {
+      "enable": true,
+      "parse_pure_ip": false,
+      "tls": {
+        "ports": [
+          "443",
+          "8443"
+        ]
+      },
+      "http": {
+        "ports": [
+          "80",
+          "8080-8880"
+        ],
+        "override_destination": true
+      }
+    },
+    "additional_rules": [],
+    "rule_providers": [],
+    "custom_proxy_groups": [],
+    "subscription_info": {
+      "enabled": true,
+      "expose_header": true,
+      "show_per_source": true,
+      "merge_strategy": "sum",
+      "expire_strategy": "earliest"
+    }
+  }
+}
